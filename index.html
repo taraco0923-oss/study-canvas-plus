@@ -9,18 +9,46 @@ import{getFirestore,doc,setDoc,deleteDoc,onSnapshot,collection,writeBatch}from'h
 // 正しい値を使う場合はFirebaseコンソール「プロジェクトの設定 > マイアプリ」からコピーして appId に設定してください。
 const config={apiKey:'AIzaSyBjI8g8rL-P1hqsqq6l2GlaS0_5KteBM2M',authDomain:'kokushi-ac6b3.firebaseapp.com',projectId:'kokushi-ac6b3',messagingSenderId:'544618153784'};
 // Firebase Authenticationの承認済みドメイン。ここ以外のURL(Netlifyのデプロイ固有URL「xxxx--…netlify.app」やデプロイプレビュー等)では auth/unauthorized-domain になる
-const PROD_HOST='bejewelled-pithivier-448f7e.netlify.app',AUTH_HOSTS=[PROD_HOST,'localhost','kokushi-ac6b3.firebaseapp.com','kokushi-ac6b3.web.app'];
+const PROD_HOST='taraco0923-oss.github.io',PROD_URL='https://taraco0923-oss.github.io/study-canvas-plus/',AUTH_HOSTS=[PROD_HOST,'localhost','kokushi-ac6b3.firebaseapp.com','kokushi-ac6b3.web.app'];
 const hostAuthorized=()=>/^https?:$/.test(location.protocol)&&AUTH_HOSTS.some(d=>location.hostname===d||location.hostname.endsWith('.'+d));
-const openProd=()=>{if(confirm('このURL（'+(location.hostname||location.protocol)+'）はFirebaseの承認済みドメインではないため、Googleログインできません。\n\n正式URL https://'+PROD_HOST+'/ を開きますか？\n\n※端末内のノートはURLごとに別保存です。必要なら先に「⬇ 保存」でバックアップし、正式URLで「⬆ 復元」してください。'))location.href='https://'+PROD_HOST+'/'};
+const openProd=()=>{if(confirm('このURL（'+(location.hostname||location.protocol)+'）はFirebaseの承認済みドメインではないため、Googleログインできません。\n\n正式URL https://'+PROD_HOST+'/ を開きますか？\n\n※端末内のノートはURLごとに別保存です。必要なら先に「⬇ 保存」でバックアップし、正式URLで「⬆ 復元」してください。'))location.href=PROD_URL};
 const app=initializeApp(config),auth=getAuth(app),db=getFirestore(app),provider=new GoogleAuthProvider();
 const $=s=>document.querySelector(s),uid=()=>auth.currentUser?.uid,genid=()=>crypto.randomUUID?.()||String(Date.now()+Math.random());
-let data={subjects:[{id:'physics',name:'放射線物理学'}],cards:[],links:[]},subject='physics',selected=[],zoom=1,offset={x:40,y:35},connectMode=false,viewList=[],viewIndex=0,cloudUnsub=null,remoteReady=false,dirty=new Set(),syncTimer=null,ignoreRemote=false;
+let data={subjects:[{id:'physics',name:'放射線物理学'}],cards:[],links:[]},subject='physics',selected=[],zoom=1,offset={x:40,y:35},connectMode=false,viewList=[],viewIndex=0,cloudUnsub=null,remoteReady=false,dirty=new Set(),syncTimer=null,ignoreRemote=false,importing=false,syncInProgress=false,remotePauseUntil=0;
 const key='studycanvasplus2_local';try{let saved=JSON.parse(localStorage.getItem(key));if(saved?.subjects&&saved?.cards)data=saved}catch{}
 subject=data.subjects[0]?.id||'physics';
 const status=s=>$('#status').textContent=s;function persist(){try{localStorage.setItem(key,JSON.stringify(data));status(uid()?'保存済み・同期待機':'端末に保存済み')}catch(e){status('端末容量不足：バックアップしてください')}}
 function changed(ids=[]){persist();ids.forEach(id=>dirty.add(id));render();scheduleSync()}
-function scheduleSync(){if(!uid()||!remoteReady||!dirty.size)return;clearTimeout(syncTimer);syncTimer=setTimeout(sync,650)}
-async function sync(){if(!uid()||!remoteReady)return;const ids=[...dirty];dirty.clear();try{status('☁ 同期中…');for(const id of ids){if(id==='meta'){await setDoc(doc(db,'users',uid(),'settings','main'),{subjects:data.subjects,links:data.links,updated:Date.now()});continue}const card=data.cards.find(c=>c.id===id);if(card){const payload={...card,updated:Date.now()};if(JSON.stringify(payload).length>900000){status('画像が大きすぎます');continue}await setDoc(doc(db,'users',uid(),'cards',id),payload)}else await deleteDoc(doc(db,'users',uid(),'cards',id))}status('☁ 同期完了')}catch(e){ids.forEach(id=>dirty.add(id));status('同期エラー：'+e.code);console.error(e)}}
+function scheduleSync(){if(!uid()||!remoteReady||!dirty.size||importing)return;clearTimeout(syncTimer);syncTimer=setTimeout(sync,650)}
+async function sync(){
+ if(!uid()||!remoteReady||importing||syncInProgress||!dirty.size)return;
+ syncInProgress=true;
+ const ids=[...dirty];
+ // Do not clear dirty until every write has completed: snapshot listeners must not
+ // replace the local card list with a partially uploaded remote list.
+ try{
+  status('☁ 同期中…');
+  const userId=uid();
+  for(const id of ids){
+   if(id==='meta'){
+    await setDoc(doc(db,'users',userId,'settings','main'),{subjects:data.subjects,links:data.links,updated:Date.now()});
+    continue;
+   }
+   const card=data.cards.find(c=>c.id===id);
+   if(card){
+    const payload={...card,updated:Date.now()};
+    if(JSON.stringify(payload).length>900000)throw new Error('画像が大きすぎます。小さい画像でお試しください');
+    await setDoc(doc(db,'users',userId,'cards',id),payload);
+   }else await deleteDoc(doc(db,'users',userId,'cards',id));
+  }
+  ids.forEach(id=>dirty.delete(id));
+  // Firestore listeners can deliver older snapshots just after a write finishes.
+  remotePauseUntil=Date.now()+2000;
+  status('☁ 同期完了');
+ }catch(e){status('同期エラー：'+(e.code||e.message));console.error(e)}
+ finally{syncInProgress=false;if(dirty.size)scheduleSync()}
+}
+function canApplyRemote(){return !importing&&!syncInProgress&&!dirty.size&&Date.now()>=remotePauseUntil}
 function render(){renderSubjects();renderCards();drawLinks();$('#connect').classList.toggle('active',connectMode);$('#view').textContent='▶ 連続表示'+(selected.length?' ('+selected.length+'枚)':'');$('#tip').textContent=selected.length?selected.length+'枚選択中。選択順に自動接続・「連続表示」でページ送りできます。':'カードを順番にクリックすると自動でつながります。';$('#zoomlabel').textContent=Math.round(zoom*100)+'%';$('#world').style.transform=`translate(${offset.x}px,${offset.y}px) scale(${zoom})`}
 function renderSubjects(){const el=$('#subjects');el.innerHTML='';for(const s of data.subjects){const b=document.createElement('button');b.textContent=(subject===s.id?'● ':'○ ')+s.name;b.style.background=subject===s.id?'#3b628a':'';b.onclick=()=>{subject=s.id;selected=[];render()};el.append(b)}}
 function renderCards(){const el=$('#cards');el.innerHTML='';const list=data.cards.filter(c=>c.subject===subject);list.forEach((c,i)=>{let d=document.createElement('div');d.className='card'+(selected.includes(c.id)?' selected':'');d.style.left=c.x+'px';d.style.top=c.y+'px';d.dataset.id=c.id;const bar=document.createElement('div');bar.className='bar';bar.innerHTML=`<span>${selected.includes(c.id)?'☑ 選択中':'□ 選択'} <span class="number">${selected.includes(c.id)?selected.indexOf(c.id)+1:i+1}</span></span>`;const open=document.createElement('button');open.textContent='開く';open.onclick=e=>{e.stopPropagation();openViewer(c.id)};bar.append(open);d.append(bar);const content=document.createElement('div');content.className='content';if(c.type==='image'){let img=document.createElement('img');img.src=c.content;content.append(img)}else content.textContent=c.content;d.append(content);d.addEventListener('click',()=>{if(selected.includes(c.id)){selected=selected.filter(id=>id!==c.id);render();return}let prev=selected[selected.length-1];selected.push(c.id);if(prev&&prev!==c.id&&!data.links.some(l=>l.a===prev&&l.b===c.id)){data.links.push({a:prev,b:c.id});changed(['meta'])}else render()});d.addEventListener('dblclick',()=>c.type==='text'?edit(c):openViewer(c.id));let drag=null;bar.addEventListener('pointerdown',e=>{if(e.target.tagName==='BUTTON')return;drag={x:e.clientX,y:e.clientY,ox:c.x,oy:c.y};bar.setPointerCapture(e.pointerId)});bar.addEventListener('pointermove',e=>{if(!drag)return;c.x=drag.ox+(e.clientX-drag.x)/zoom;c.y=drag.oy+(e.clientY-drag.y)/zoom;d.style.left=c.x+'px';d.style.top=c.y+'px';drawLinks()});bar.addEventListener('pointerup',()=>{if(drag){drag=null;changed([c.id])}});el.append(d)})}
@@ -28,12 +56,52 @@ function drawLinks(){let svg=$('#links');svg.innerHTML='';for(let l of data.link
 function nextPos(i){const existing=data.cards.filter(c=>c.subject===subject).length+i;return{x:70+(existing%5)*255,y:70+Math.floor(existing/5)*220}}
 $('#addsubject').onclick=()=>{let name=$('#subjectname').value.trim();if(!name)return;let id=genid();data.subjects.push({id,name});subject=id;$('#subjectname').value='';selected=[];changed(['meta'])};
 $('#addtext').onclick=()=>edit(null);let editing=null;function edit(c){editing=c;$('#modtitle').textContent=c?'文章を編集':'文章を追加';$('#edittext').value=c?.content||'';$('#modal').classList.add('open')}$('#cancel').onclick=()=>$('#modal').classList.remove('open');$('#saveedit').onclick=()=>{let t=$('#edittext').value;if(editing){editing.content=t;changed([editing.id])}else{let c={id:genid(),subject,type:'text',content:t,...nextPos(0)};data.cards.push(c);const prev=selected[selected.length-1];if(prev&&prev!==c.id&&!data.links.some(l=>l.a===prev&&l.b===c.id))data.links.push({a:prev,b:c.id});selected.push(c.id);changed([c.id,'meta'])}$('#modal').classList.remove('open')};
-$('#addimg').onclick=()=>$('#file').click();$('#file').onchange=async e=>{let files=[...e.target.files];if(!files.length)return;status('画像を処理中…');let ids=[];try{for(let i=0;i<files.length;i++){let image=await compress(files[i]);let c={id:genid(),subject,type:'image',content:image,...nextPos(0)};data.cards.push(c);ids.push(c.id);if(i>0)data.links.push({a:ids[i-1],b:ids[i]})}selected=[...ids];changed([...ids,'meta'])}catch(err){if(ids.length){selected=[...ids];changed([...ids,'meta'])}alert('一部の画像を読み込めませんでした。'+(err?.message||''))}finally{$('#file').value=''}};
+$('#addimg').onclick=()=>$('#file').click();
+$('#file').onchange=async e=>{
+ const files=Array.from(e.target.files||[]);
+ if(!files.length)return;
+ if(importing)return;
+ importing=true;
+ const button=$('#addimg');button.disabled=true;
+ const imported=[];
+ const targetSubject=subject;
+ const oldSelection=[...selected];
+ try{
+  // Convert all files first, then add all cards as one local transaction.
+  // This prevents Firestore snapshots from overwriting a half-finished import.
+  for(let i=0;i<files.length;i++){
+   status(`画像を処理中… ${i+1}/${files.length}`);
+   const image=await compress(files[i]);
+   imported.push({id:genid(),subject:targetSubject,type:'image',content:image});
+  }
+  const base=data.cards.filter(c=>c.subject===targetSubject).length;
+  for(let i=0;i<imported.length;i++){
+   const n=base+i;
+   imported[i].x=70+(n%5)*255;
+   imported[i].y=70+Math.floor(n/5)*220;
+  }
+  const previous=oldSelection[oldSelection.length-1];
+  if(previous&&imported.length&&data.cards.some(c=>c.id===previous&&c.subject===targetSubject)){
+   if(!data.links.some(l=>l.a===previous&&l.b===imported[0].id))data.links.push({a:previous,b:imported[0].id});
+  }
+  for(let i=1;i<imported.length;i++)data.links.push({a:imported[i-1].id,b:imported[i].id});
+  data.cards.push(...imported);
+  selected=imported.map(c=>c.id);
+  changed([...selected,'meta']);
+  status(`${imported.length}枚追加しました・同期待機`);
+ }catch(err){
+  console.error(err);
+  alert('画像を追加できませんでした。'+(err?.message||'画像形式を確認してください'));
+ }finally{
+  importing=false;button.disabled=false;$('#file').value='';
+  scheduleSync();
+ }
+};
 function compress(file){return new Promise((resolve,reject)=>{let im=new Image(),url=URL.createObjectURL(file);im.onload=()=>{let canvas=document.createElement('canvas'),scale=Math.min(1,1500/im.width,1900/im.height);canvas.width=Math.max(1,Math.round(im.width*scale));canvas.height=Math.max(1,Math.round(im.height*scale));let ctx=canvas.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.drawImage(im,0,0,canvas.width,canvas.height);URL.revokeObjectURL(url);let quality=.78,result=canvas.toDataURL('image/jpeg',quality);while(result.length>700000&&quality>.35){quality-=.12;result=canvas.toDataURL('image/jpeg',quality)}if(result.length>700000){let ratio=Math.sqrt(650000/result.length);let smaller=document.createElement('canvas');smaller.width=Math.round(canvas.width*ratio);smaller.height=Math.round(canvas.height*ratio);smaller.getContext('2d').drawImage(canvas,0,0,smaller.width,smaller.height);result=smaller.toDataURL('image/jpeg',.6)}resolve(result)};im.onerror=reject;im.src=url})}
 $('#clearselect').onclick=()=>{selected=[];render()};$('#connect').onclick=()=>{if(selected.length<2){alert('先に2枚以上のカードを順番に選択してください。選ぶだけで自動的に線がつながります。');return}let added=false;for(let i=1;i<selected.length;i++){let a=selected[i-1],b=selected[i];if(!data.links.some(l=>l.a===a&&l.b===b)){data.links.push({a,b});added=true}}if(added)changed(['meta']);else render()};$('#unlink').onclick=()=>{data.links=data.links.filter(l=>!selected.includes(l.a)&&!selected.includes(l.b));selected=[];changed(['meta'])};$('#remove').onclick=()=>{if(!selected.length)return;if(!confirm('選択したカードを削除しますか？'))return;let ids=[...selected];data.cards=data.cards.filter(c=>!ids.includes(c.id));data.links=data.links.filter(l=>!ids.includes(l.a)&&!ids.includes(l.b));selected=[];changed([...ids,'meta'])};
 let pan=null;$('#workspace').addEventListener('pointerdown',e=>{if(e.target.closest('.card')||e.target.closest('#zoom'))return;pan={x:e.clientX,y:e.clientY,ox:offset.x,oy:offset.y};$('#workspace').setPointerCapture(e.pointerId)});$('#workspace').addEventListener('pointermove',e=>{if(!pan)return;offset.x=pan.ox+e.clientX-pan.x;offset.y=pan.oy+e.clientY-pan.y;render()});$('#workspace').addEventListener('pointerup',()=>pan=null);$('#workspace').addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(.3,Math.min(2,zoom*(e.deltaY>0?.9:1.1)));render()},{passive:false});$('#minus').onclick=()=>{zoom=Math.max(.3,zoom-.15);render()};$('#plus').onclick=()=>{zoom=Math.min(2,zoom+.15);render()};
 function chain(start){let arr=[],seen=new Set(),id=start;while(id&&!seen.has(id)){let c=data.cards.find(c=>c.id===id);if(!c)break;arr.push(c);seen.add(id);id=data.links.find(l=>l.a===id)?.b}return arr}function openViewer(id,preferSelection=false){const ordered=selected.map(sid=>data.cards.find(c=>c.id===sid)).filter(c=>c&&c.subject===subject);viewList=preferSelection&&ordered.length?ordered:chain(id);if(!viewList.length)return;viewIndex=0;showView();$('#viewer').classList.add('open')}function showView(){let c=viewList[viewIndex];$('#vcount').textContent=`${viewIndex+1} / ${viewList.length}`;$('#viewbody').innerHTML='';if(c.type==='image'){let img=document.createElement('img');img.src=c.content;$('#viewbody').append(img)}else{let pre=document.createElement('pre');pre.textContent=c.content;$('#viewbody').append(pre)}}$('#view').onclick=()=>{let id=selected[0]||data.cards.find(c=>c.subject===subject)?.id;if(id)openViewer(id,true);else alert('カードを追加してください')};$('#prev').onclick=()=>{viewIndex=Math.max(0,viewIndex-1);showView()};$('#next').onclick=()=>{viewIndex=Math.min(viewList.length-1,viewIndex+1);showView()};$('#vclose').onclick=()=>$('#viewer').classList.remove('open');document.addEventListener('keydown',e=>{if(!$('#viewer').classList.contains('open'))return;if(e.key==='ArrowRight')$('#next').click();else if(e.key==='ArrowLeft')$('#prev').click();else if(e.key==='Escape')$('#vclose').click()});let touchX=null;$('#viewbody').addEventListener('touchstart',e=>touchX=e.touches[0].clientX,{passive:true});$('#viewbody').addEventListener('touchend',e=>{if(touchX===null)return;let diff=e.changedTouches[0].clientX-touchX;if(Math.abs(diff)>50){viewIndex=Math.max(0,Math.min(viewList.length-1,viewIndex+(diff<0?1:-1)));showView()}touchX=null});
 $('#backup').onclick=()=>{let blob=new Blob([JSON.stringify(data)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='StudyCanvasPLUS2_backup_'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};$('#restore').onclick=()=>$('#restorefile').click();$('#restorefile').onchange=async e=>{try{let obj=JSON.parse(await e.target.files[0].text());if(!Array.isArray(obj.subjects)||!Array.isArray(obj.cards))throw Error();if(!confirm('現在のノートをバックアップしましたか？復元すると現在のノートを置き換えます。'))return;data={subjects:obj.subjects,cards:obj.cards,links:obj.links||[]};subject=data.subjects[0]?.id;selected=[];changed(['meta',...data.cards.map(c=>c.id)]);alert('復元しました')}catch{alert('このバックアップは読み込めませんでした')}};
 $('#login').onclick=async()=>{if(!hostAuthorized())return openProd();try{await signInWithPopup(auth,provider)}catch(e){if(e.code==='auth/unauthorized-domain')return openProd();if(['auth/popup-closed-by-user','auth/cancelled-popup-request'].includes(e.code))return;if(['auth/popup-blocked','auth/operation-not-supported-in-this-environment'].includes(e.code)){try{await signInWithRedirect(auth,provider)}catch(e2){alert('ログインできませんでした：'+e2.code)}}else alert('ログインできませんでした：'+e.code)}};$('#logout').onclick=async()=>{if(!confirm('ログアウトしますか？端末内のデータは残ります。'))return;cloudUnsub?.();cloudUnsub=null;remoteReady=false;await signOut(auth)};
-getRedirectResult(auth).catch(e=>{console.warn(e);if(e.code==='auth/unauthorized-domain')status('このURLではログイン不可・端末に保存')});onAuthStateChanged(auth,user=>{cloudUnsub?.();cloudUnsub=null;remoteReady=false;$('#login').style.display=user?'none':'';$('#logout').style.display=user?'block':'none';if(!user){status(hostAuthorized()?'端末に保存済み・未ログイン':'このURLではログイン不可・端末に保存');return}status('☁ クラウドを確認中…');let gotMeta=false,gotCards=false,meta=null,cards=[];const tryReady=()=>{if(!gotMeta||!gotCards)return;if(!remoteReady){remoteReady=true;if(meta||cards.length){if(data.cards.length&&!confirm('クラウドのノートをこの端末に読み込みますか？「キャンセル」は端末のノートをクラウドに保存します。')){dirty.add('meta');data.cards.forEach(c=>dirty.add(c.id));scheduleSync();return}data={subjects:meta?.subjects||data.subjects,cards,links:meta?.links||[]};subject=data.subjects[0]?.id||'physics';persist();render()}else{dirty.add('meta');data.cards.forEach(c=>dirty.add(c.id));scheduleSync()}status('☁ 同期接続済み')}};const unsubs=[];unsubs.push(onSnapshot(doc(db,'users',user.uid,'settings','main'),s=>{meta=s.exists()?s.data():null;gotMeta=true;tryReady();if(remoteReady&&!dirty.size&&meta){data.subjects=meta.subjects||data.subjects;data.links=meta.links||[];persist();render()}},e=>status('同期エラー '+e.code)));unsubs.push(onSnapshot(collection(db,'users',user.uid,'cards'),s=>{cards=s.docs.map(d=>d.data());gotCards=true;tryReady();if(remoteReady&&!dirty.size){data.cards=cards;persist();render()}},e=>status('同期エラー '+e.code)));cloudUnsub=()=>unsubs.forEach(f=>f())});render();
+getRedirectResult(auth).catch(e=>{console.warn(e);if(e.code==='auth/unauthorized-domain')status('このURLではログイン不可・端末に保存')});onAuthStateChanged(auth,user=>{cloudUnsub?.();cloudUnsub=null;remoteReady=false;$('#login').style.display=user?'none':'';$('#logout').style.display=user?'block':'none';if(!user){status(hostAuthorized()?'端末に保存済み・未ログイン':'このURLではログイン不可・端末に保存');return}status('☁ クラウドを確認中…');let gotMeta=false,gotCards=false,meta=null,cards=[];const tryReady=()=>{if(!gotMeta||!gotCards)return;if(!remoteReady){remoteReady=true;if(meta||cards.length){if(data.cards.length&&!confirm('クラウドのノートをこの端末に読み込みますか？「キャンセル」は端末のノートをクラウドに保存します。')){dirty.add('meta');data.cards.forEach(c=>dirty.add(c.id));scheduleSync();return}data={subjects:meta?.subjects||data.subjects,cards,links:meta?.links||[]};subject=data.subjects[0]?.id||'physics';persist();render()}else{dirty.add('meta');data.cards.forEach(c=>dirty.add(c.id));scheduleSync()}status('☁ 同期接続済み')}};const unsubs=[];unsubs.push(onSnapshot(doc(db,'users',user.uid,'settings','main'),s=>{meta=s.exists()?s.data():null;gotMeta=true;tryReady();if(remoteReady&&canApplyRemote()&&meta){data.subjects=meta.subjects||data.subjects;data.links=meta.links||[];persist();render()}},e=>status('同期エラー '+e.code)));unsubs.push(onSnapshot(collection(db,'users',user.uid,'cards'),s=>{cards=s.docs.map(d=>d.data());gotCards=true;tryReady();if(remoteReady&&canApplyRemote()){data.cards=cards;persist();render()}},e=>status('同期エラー '+e.code)));cloudUnsub=()=>unsubs.forEach(f=>f())});render();
 </script></body></html>
